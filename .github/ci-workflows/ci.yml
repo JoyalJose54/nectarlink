@@ -1,0 +1,414 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  QT_VERSION: "6.12.0"
+  # The crates that build without Qt or the Android NDK.
+  CORE_CRATES: -p nectarlink-protocol -p nectarlink-core -p nectarlink-ffi -p nectarlink-cli -p nectarlink-adb -p xtask
+
+jobs:
+  # Whether anything but docs changed (docs-only.sh). A push or pull request
+  # that changes only docs skips the builds below; skipped jobs count as
+  # passed. Anything it can't tell, such as a new branch, a force push or a
+  # manual run, builds everything.
+  changes:
+    name: What changed
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.diff.outputs.code }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - id: diff
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          case "$EVENT" in
+            push) from="$BEFORE" ;;
+            pull_request) from="$BASE" ;;
+            *) from="" ;;
+          esac
+          code=true
+          if [ -n "$from" ] && git cat-file -e "$from^{commit}" 2>/dev/null &&
+            git diff --name-only --no-renames "$from" HEAD | bash .github/scripts/docs-only.sh; then
+            code=false
+            echo "::notice::Only docs changed: skipping the builds"
+          fi
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+
+  core:
+    name: Core (${{ matrix.os }})
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install the pinned Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        if: runner.os == 'Linux'
+        run: cargo fmt --all --check
+      - name: Clippy
+        shell: bash
+        run: cargo clippy --locked $CORE_CRATES --all-targets -- -D warnings
+      - name: Tests
+        shell: bash
+        run: cargo test --locked $CORE_CRATES
+      - name: Generated files are up to date
+        if: runner.os == 'Linux'
+        run: |
+          cargo xtask tokens --check
+          cargo xtask strings --check
+
+  # A skipped job counts as passed, but a skipped matrix job reports once, as
+  # "Core (${{ matrix.os }})", so the "Core (<os>)" checks main requires never
+  # appear and a docs-only pull request can't merge. On a docs-only change
+  # this reports them, with nothing to build.
+  core-docs-only:
+    name: Core (${{ matrix.os }})
+    needs: changes
+    if: needs.changes.outputs.code != 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - run: echo "Only docs changed; nothing to build or test."
+
+  # The Windows app's lints and tests, and its release build and installer,
+  # run side by side: each takes about as long as the other.
+  desktop-checks:
+    name: Windows app (x64) checks
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install the pinned Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_64
+          cache: true
+          # Qt 6.12's repository layout needs a current aqtinstall.
+          aqtsource: git+https://github.com/miurahr/aqtinstall.git
+      - name: Clippy
+        run: cargo clippy --locked -p nectarlink-desktop -p nectarlink-vcam -p s1-qt-rust --all-targets -- -D warnings
+      - name: Tests
+        run: cargo test --locked -p nectarlink-desktop -p nectarlink-vcam
+      - name: QML tests
+        shell: pwsh
+        run: ./scripts/qml-tests.ps1
+
+  desktop:
+    name: Windows app (x64)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install the pinned Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_64
+          cache: true
+          # Qt 6.12's repository layout needs a current aqtinstall.
+          aqtsource: git+https://github.com/miurahr/aqtinstall.git
+      - name: Release build
+        run: cargo build --locked --release -p nectarlink-desktop -p nectarlink-vcam
+      - name: Install NSIS
+        shell: pwsh
+        run: |
+          if (-not (Get-Command makensis -ErrorAction SilentlyContinue) -and
+              -not (Test-Path "${env:ProgramFiles(x86)}\NSIS\makensis.exe")) {
+            choco install nsis --yes --no-progress
+          }
+      - name: Installer
+        shell: pwsh
+        run: ./scripts/package.ps1 -SkipBuild
+      - name: Open the main window, with no QML warnings
+        shell: pwsh
+        run: ./scripts/ui-check.ps1
+      - name: Install, run and uninstall it
+        shell: pwsh
+        run: ./scripts/smoke-installer.ps1
+      - uses: actions/upload-artifact@v7
+        with:
+          name: nectarlink-windows-x64
+          path: target/package/*-setup.exe
+          retention-days: 14
+
+  desktop-arm64:
+    name: Windows app (ARM64 cross build)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install the pinned Rust toolchain and the ARM64 target
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup target add aarch64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Qt (ARM64, with the x64 host tools)
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_arm64_cross_compiled
+          cache: true
+          aqtsource: git+https://github.com/miurahr/aqtinstall.git
+      - name: Install NSIS
+        shell: pwsh
+        run: |
+          if (-not (Get-Command makensis -ErrorAction SilentlyContinue) -and
+              -not (Test-Path "${env:ProgramFiles(x86)}\NSIS\makensis.exe")) {
+            choco install nsis --yes --no-progress
+          }
+      - name: Build and Package
+        shell: pwsh
+        run: ./scripts/package.ps1 -Arch arm64
+      - uses: actions/upload-artifact@v7
+        with:
+          name: nectarlink-windows-arm64
+          path: target/package/*-setup.exe
+          retention-days: 14
+
+  desktop-macos:
+    name: macOS app
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install the pinned Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          host: mac
+          target: desktop
+          arch: clang_64
+          cache: true
+          aqtsource: git+https://github.com/miurahr/aqtinstall.git
+      - name: Clippy
+        run: cargo clippy --locked -p nectarlink-desktop --all-targets -- -D warnings
+      - name: Tests
+        run: cargo test --locked -p nectarlink-desktop
+
+  desktop-macos-release:
+    name: macOS app (release build)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install the pinned Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          host: mac
+          target: desktop
+          arch: clang_64
+          cache: true
+          aqtsource: git+https://github.com/miurahr/aqtinstall.git
+      - name: Release build
+        run: cargo build --locked --release -p nectarlink-desktop
+
+  desktop-linux:
+    name: Linux app (x64)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install the pinned Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Where the system packages are cached
+        id: apt
+        run: |
+          echo "prefix=apt-$ImageOS-" >> "$GITHUB_OUTPUT"
+          echo "key=apt-$ImageOS-$ImageVersion-v1" >> "$GITHUB_OUTPUT"
+      # Their mirror is sometimes slow (5 minutes for 74 MB), so the packages
+      # come from this cache, refreshed with each new runner image.
+      - uses: actions/cache@v6
+        with:
+          path: ~/apt-archives
+          key: ${{ steps.apt.outputs.key }}
+          restore-keys: ${{ steps.apt.outputs.prefix }}
+      - name: Install system dependencies
+        run: |
+          mkdir -p ~/apt-archives/partial
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends -o Dir::Cache::Archives="$HOME/apt-archives" \
+            libgl1-mesa-dev libxkbcommon-dev libvulkan-dev libx11-dev \
+            ffmpeg libavcodec-dev libavutil-dev libopenh264-dev qt6-l10n-tools
+          # Drop what the mirror no longer has, so the cache doesn't grow.
+          sudo apt-get autoclean -o Dir::Cache::Archives="$HOME/apt-archives"
+          sudo chown -R "$USER" ~/apt-archives
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          host: linux
+          target: desktop
+          arch: linux_gcc_64
+          cache: true
+          aqtsource: git+https://github.com/miurahr/aqtinstall.git
+      - name: Clippy
+        run: cargo clippy --locked -p nectarlink-desktop -p nectarlink-vcam -p s1-qt-rust --all-targets -- -D warnings
+      - name: Tests
+        run: cargo test --locked -p nectarlink-desktop -p nectarlink-vcam
+      - name: Video adapter fallback
+        run: bash desktop/app/tests/linux_video_dispatch_test.sh
+      - name: Check without the optional FFmpeg backend
+        env:
+          LIBAVCODEC_NO_PKG_CONFIG: "1"
+        run: cargo check --locked -p nectarlink-desktop --tests
+
+  desktop-linux-release:
+    name: Linux app (x64, release build)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install the pinned Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Where the system packages are cached
+        id: apt
+        run: |
+          echo "prefix=apt-$ImageOS-" >> "$GITHUB_OUTPUT"
+          echo "key=apt-$ImageOS-$ImageVersion-v1" >> "$GITHUB_OUTPUT"
+      # Their mirror is sometimes slow (5 minutes for 74 MB), so the packages
+      # come from this cache, refreshed with each new runner image.
+      - uses: actions/cache@v6
+        with:
+          path: ~/apt-archives
+          key: ${{ steps.apt.outputs.key }}
+          restore-keys: ${{ steps.apt.outputs.prefix }}
+      - name: Install system dependencies
+        run: |
+          mkdir -p ~/apt-archives/partial
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends -o Dir::Cache::Archives="$HOME/apt-archives" \
+            libgl1-mesa-dev libxkbcommon-dev libvulkan-dev libx11-dev \
+            ffmpeg libavcodec-dev libavutil-dev libopenh264-dev qt6-l10n-tools
+          # Drop what the mirror no longer has, so the cache doesn't grow.
+          sudo apt-get autoclean -o Dir::Cache::Archives="$HOME/apt-archives"
+          sudo chown -R "$USER" ~/apt-archives
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          host: linux
+          target: desktop
+          arch: linux_gcc_64
+          cache: true
+          aqtsource: git+https://github.com/miurahr/aqtinstall.git
+      - name: Release build
+        run: cargo build --locked --release -p nectarlink-desktop -p nectarlink-vcam
+
+  linux-install:
+    name: Linux packages and install.sh
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install the packaging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends rpm shellcheck
+      - name: Check the scripts
+        run: |
+          shellcheck -s sh desktop/packaging/linux/install.sh
+          shellcheck desktop/packaging/linux/build-rpm.sh desktop/packaging/linux/test-install.sh
+      - name: Install and remove each package with install.sh
+        run: desktop/packaging/linux/test-install.sh
+
+  android:
+    name: Android app
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install the pinned Rust toolchain and the Android targets
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup target add aarch64-linux-android x86_64-linux-android
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-ndk
+        run: cargo install --locked cargo-ndk
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: android-actions/setup-android@v4
+        with:
+          # Command-line tools 23.0: older versions don't list platform 37.0.
+          cmdline-tools-version: "16111833"
+          packages: "platforms;android-37.0 ndk;30.0.16248370"
+      - uses: gradle/actions/setup-gradle@v6
+      - name: Unit tests and debug build
+        working-directory: android
+        run: ./gradlew --no-daemon testDebugUnitTest lintDebug assembleDebug
+      - uses: actions/upload-artifact@v7
+        with:
+          name: nectarlink-android-debug
+          path: android/app/build/outputs/apk/debug/*.apk
+          retention-days: 14
+
+  policy:
+    name: Licenses and dependencies
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: License headers
+        shell: pwsh
+        run: ./scripts/check-headers.ps1
+      - name: Dependency policy (licenses, advisories, sources)
+        uses: EmbarkStudios/cargo-deny-action@v2

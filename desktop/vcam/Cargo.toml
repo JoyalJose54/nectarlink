@@ -1,0 +1,46 @@
+[package]
+name = "nectarlink-vcam"
+description = "NectarLink virtual camera Media Foundation media source (Windows 11)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+publish = false
+
+[lib]
+name = "nectarlink_vcam"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+ab_glyph = "0.2"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Media_KernelStreaming",
+    "Win32_Media_MediaFoundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_SystemServices",
+    "Win32_System_Variant",
+] }
+windows-core.workspace = true
+
+[build-dependencies]
+embed-resource.workspace = true
+
+[lints]
+workspace = true

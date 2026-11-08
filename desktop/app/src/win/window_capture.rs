@@ -1,0 +1,350 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//! One window's own pixels, with Windows Graphics Capture: what the window
+//! shows even with other windows in front of it, and never theirs. Play on
+//! phone streams a player's window this way, cropped to its video.
+
+use windows::{
+    Graphics::{
+        Capture::{
+            Direct3D11CaptureFramePool, GraphicsCaptureAccess, GraphicsCaptureAccessKind,
+            GraphicsCaptureItem, GraphicsCaptureSession,
+        },
+        DirectX::{Direct3D11::IDirect3DDevice, DirectXPixelFormat},
+        SizeInt32,
+    },
+    Win32::{
+        Foundation::{HWND, RECT},
+        Graphics::{
+            Direct3D::D3D_DRIVER_TYPE_HARDWARE,
+            Direct3D11::{
+                D3D11_BOX, D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAP_READ,
+                D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
+                D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
+            },
+            Dxgi::{Common::DXGI_FORMAT_B8G8R8A8_UNORM, Common::DXGI_SAMPLE_DESC, IDXGIDevice},
+        },
+        System::{
+            Com::{COINIT_MULTITHREADED, CoInitializeEx},
+            WinRT::{
+                Direct3D11::{CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess},
+                Graphics::Capture::IGraphicsCaptureItemInterop,
+            },
+        },
+    },
+    core::{Interface, factory},
+};
+
+/// Frames the pool holds: one being read, one arriving.
+const BUFFERS: i32 = 2;
+
+/// A running capture of one window.
+pub struct WindowCapture {
+    hwnd: HWND,
+    device: ID3D11Device,
+    context: ID3D11DeviceContext,
+    winrt_device: IDirect3DDevice,
+    pool: Direct3D11CaptureFramePool,
+    session: GraphicsCaptureSession,
+    size: SizeInt32,
+    staging: Option<(ID3D11Texture2D, u32, u32)>,
+    /// The latest crop, kept for when no new frame came (nothing changed).
+    last: Vec<u8>,
+    last_size: (u32, u32),
+}
+
+impl WindowCapture {
+    /// Starts capturing `hwnd`, without the pointer and, where Windows
+    /// allows it, without the yellow capture border.
+    pub fn new(hwnd: HWND) -> windows::core::Result<WindowCapture> {
+        // SAFETY: COM for this thread (WinRT needs it; a second call is harmless).
+        let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+        if !GraphicsCaptureSession::IsSupported()? {
+            return Err(windows::core::Error::from(windows::Win32::Foundation::E_NOTIMPL));
+        }
+        let mut device = None;
+        let mut context = None;
+        // SAFETY: plain Direct3D and WinRT interop calls with owned values.
+        unsafe {
+            D3D11CreateDevice(
+                None,
+                D3D_DRIVER_TYPE_HARDWARE,
+                Default::default(),
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                None,
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                None,
+                Some(&mut context),
+            )?;
+        }
+        let device: ID3D11Device =
+            device.ok_or_else(|| windows::core::Error::from(windows::Win32::Foundation::E_FAIL))?;
+        let context =
+            context.ok_or_else(|| windows::core::Error::from(windows::Win32::Foundation::E_FAIL))?;
+        // SAFETY: as above.
+        let (winrt_device, item) = unsafe {
+            let dxgi: IDXGIDevice = device.cast()?;
+            let winrt_device: IDirect3DDevice = CreateDirect3D11DeviceFromDXGIDevice(&dxgi)?.cast()?;
+            let interop = factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()?;
+            let item: GraphicsCaptureItem = interop.CreateForWindow(hwnd)?;
+            (winrt_device, item)
+        };
+        let size = item.Size()?;
+        let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
+            &winrt_device,
+            DirectXPixelFormat::B8G8R8A8UIntNormalized,
+            BUFFERS,
+            size,
+        )?;
+        let session = pool.CreateCaptureSession(&item)?;
+        let _ = session.SetIsCursorCaptureEnabled(false);
+        // Windows 11 can leave the border off; earlier versions always draw it.
+        if GraphicsCaptureAccess::RequestAccessAsync(GraphicsCaptureAccessKind::Borderless)
+            .and_then(|asked| asked.join())
+            .is_ok()
+        {
+            let _ = session.SetIsBorderRequired(false);
+        }
+        session.StartCapture()?;
+        Ok(WindowCapture {
+            hwnd,
+            device,
+            context,
+            winrt_device,
+            pool,
+            session,
+            size,
+            staging: None,
+            last: Vec::new(),
+            last_size: (0, 0),
+        })
+    }
+
+    /// The window this captures.
+    pub fn window(&self) -> HWND {
+        self.hwnd
+    }
+
+    /// The window's latest picture of `crop` (in the window's own pixels,
+    /// from its top-left), scaled to `dst_w` × `dst_h` into `bgra`. Without
+    /// a new frame (nothing changed on screen), the last one again. False
+    /// before the first frame.
+    pub fn capture(&mut self, crop: RECT, dst_w: u32, dst_h: u32, bgra: &mut Vec<u8>) -> bool {
+        if let Err(e) = self.latest(crop) {
+            tracing::debug!(error = %e, "window capture frame failed");
+        }
+        let (w, h) = self.last_size;
+        if w == 0 || h == 0 {
+            return false;
+        }
+        scale_bgra(&self.last, w, h, dst_w, dst_h, bgra);
+        true
+    }
+
+    /// Reads the newest frame, if one came, into `last`.
+    fn latest(&mut self, crop: RECT) -> windows::core::Result<()> {
+        // Only the newest matters: older frames are dropped.
+        let mut newest = None;
+        while let Ok(frame) = self.pool.TryGetNextFrame() {
+            newest = Some(frame);
+        }
+        let Some(frame) = newest else { return Ok(()) };
+        let content = frame.ContentSize()?;
+        if content.Width != self.size.Width || content.Height != self.size.Height {
+            // The window changed size: frames come at the new size from the next one.
+            self.size = content;
+            self.pool.Recreate(
+                &self.winrt_device,
+                DirectXPixelFormat::B8G8R8A8UIntNormalized,
+                BUFFERS,
+                content,
+            )?;
+        }
+        // SAFETY: COM calls on live interfaces; the staging texture is
+        // mapped for reading and unmapped before it's used again.
+        unsafe {
+            let access: IDirect3DDxgiInterfaceAccess = frame.Surface()?.cast()?;
+            let texture: ID3D11Texture2D = access.GetInterface()?;
+            let mut desc = D3D11_TEXTURE2D_DESC::default();
+            texture.GetDesc(&mut desc);
+            let (tw, th) =
+                (desc.Width.min(content.Width.max(0) as u32), desc.Height.min(content.Height.max(0) as u32));
+            let left = crop.left.clamp(0, tw as i32) as u32;
+            let top = crop.top.clamp(0, th as i32) as u32;
+            let right = crop.right.clamp(0, tw as i32) as u32;
+            let bottom = crop.bottom.clamp(0, th as i32) as u32;
+            if right <= left || bottom <= top {
+                return Ok(());
+            }
+            let (w, h) = (right - left, bottom - top);
+            let staging = self.staging(w, h)?;
+            let area = D3D11_BOX { left, top, front: 0, right, bottom, back: 1 };
+            self.context.CopySubresourceRegion(&staging, 0, 0, 0, 0, &texture, 0, Some(&area));
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            self.context.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
+            let row = w as usize * 4;
+            self.last.resize(row * h as usize, 0);
+            let source =
+                std::slice::from_raw_parts(mapped.pData.cast::<u8>(), mapped.RowPitch as usize * h as usize);
+            for (y, line) in self.last.chunks_exact_mut(row).enumerate() {
+                line.copy_from_slice(&source[y * mapped.RowPitch as usize..][..row]);
+            }
+            self.context.Unmap(&staging, 0);
+            self.last_size = (w, h);
+        }
+        Ok(())
+    }
+
+    /// A texture the CPU can read, `w` × `h`, reused while the size stays.
+    fn staging(&mut self, w: u32, h: u32) -> windows::core::Result<ID3D11Texture2D> {
+        if let Some((texture, sw, sh)) = &self.staging
+            && (*sw, *sh) == (w, h)
+        {
+            return Ok(texture.clone());
+        }
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: w,
+            Height: h,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Usage: D3D11_USAGE_STAGING,
+            BindFlags: 0,
+            CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+            MiscFlags: 0,
+        };
+        let mut texture = None;
+        // SAFETY: creates a texture from a filled-in description.
+        unsafe { self.device.CreateTexture2D(&desc, None, Some(&mut texture))? };
+        let texture =
+            texture.ok_or_else(|| windows::core::Error::from(windows::Win32::Foundation::E_FAIL))?;
+        self.staging = Some((texture.clone(), w, h));
+        Ok(texture)
+    }
+}
+
+impl Drop for WindowCapture {
+    fn drop(&mut self) {
+        let _ = self.session.Close();
+        let _ = self.pool.Close();
+    }
+}
+
+/// Scales a `w` × `h` BGRA picture to `dst_w` × `dst_h` (bilinear), or
+/// copies it when the size is the same.
+pub(crate) fn scale_bgra(src: &[u8], w: u32, h: u32, dst_w: u32, dst_h: u32, out: &mut Vec<u8>) {
+    let (w, h, dw, dh) = (w as usize, h as usize, dst_w as usize, dst_h as usize);
+    out.resize(dw * dh * 4, 0);
+    // Nothing to scale from (or to): black, rather than a panic.
+    if w == 0 || h == 0 || dw == 0 || dh == 0 || src.len() < w * h * 4 {
+        out.fill(0);
+        return;
+    }
+    if (w, h) == (dw, dh) {
+        out.copy_from_slice(&src[..w * h * 4]);
+        return;
+    }
+    // Where each output column samples from: left pixel and weight (of 256).
+    let columns: Vec<(usize, u32)> = (0..dw)
+        .map(|x| {
+            let at = ((x as f32 + 0.5) * w as f32 / dw as f32 - 0.5).clamp(0.0, (w - 1) as f32);
+            (at as usize, ((at - at.floor()) * 256.0) as u32)
+        })
+        .collect();
+    for (y, line) in out.chunks_exact_mut(dw * 4).enumerate() {
+        let at = ((y as f32 + 0.5) * h as f32 / dh as f32 - 0.5).clamp(0.0, (h - 1) as f32);
+        let (y0, wy) = (at as usize, ((at - at.floor()) * 256.0) as u32);
+        let y1 = (y0 + 1).min(h - 1);
+        let (top, bottom) = (&src[y0 * w * 4..][..w * 4], &src[y1 * w * 4..][..w * 4]);
+        for (x, pixel) in line.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            let (x0, wx) = columns[x];
+            let x1 = (x0 + 1).min(w - 1);
+            for c in 0..4 {
+                let row = |r: &[u8]| u32::from(r[x0 * 4 + c]) * (256 - wx) + u32::from(r[x1 * 4 + c]) * wx;
+                let value = (row(top) * (256 - wy) + row(bottom) * wy + (1 << 15)) >> 16;
+                pixel[c] = value as u8;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn same_size_is_a_copy() {
+        let src: Vec<u8> = (0..4 * 3 * 4).map(|i| i as u8).collect();
+        let mut out = Vec::new();
+        scale_bgra(&src, 4, 3, 4, 3, &mut out);
+        assert_eq!(out, src);
+    }
+
+    #[test]
+    fn halving_averages_and_a_flat_picture_stays_flat() {
+        // 4x2: left half black, right half white.
+        let mut src = Vec::new();
+        for _ in 0..2 {
+            for x in 0..4 {
+                let v = if x < 2 { 0 } else { 255 };
+                src.extend_from_slice(&[v, v, v, 255]);
+            }
+        }
+        let mut out = Vec::new();
+        scale_bgra(&src, 4, 2, 2, 1, &mut out);
+        assert_eq!(out.len(), 2 * 4);
+        assert!(out[0] < 40 && out[4] > 215, "{out:?}");
+        assert_eq!(out[3], 255);
+
+        let flat = vec![77u8; 10 * 6 * 4];
+        scale_bgra(&flat, 10, 6, 7, 3, &mut out);
+        assert!(out.iter().all(|&v| v == 77));
+    }
+    #[test]
+    fn scaling_nothing_gives_black_not_a_panic() {
+        let mut out = Vec::new();
+        scale_bgra(&[], 0, 0, 4, 2, &mut out);
+        assert_eq!(out, vec![0; 32]);
+        scale_bgra(&[1; 8], 4, 2, 4, 2, &mut out);
+        assert_eq!(out, vec![0; 32], "a short buffer");
+        scale_bgra(&[1; 32], 4, 2, 0, 0, &mut out);
+        assert!(out.is_empty());
+    }
+
+    /// With a Chromium browser showing a page whose title has
+    /// `NECTARLINK_TEST_TAB` in it: captures its window's video, covered
+    /// or not, and writes it to `NECTARLINK_TEST_DUMP` (raw BGRA) if set.
+    #[test]
+    #[ignore = "needs a browser tab titled NECTARLINK_TEST_TAB"]
+    fn captures_a_window_behind_others() {
+        use crate::win::browser::{Automation, frame_of, use_physical_pixels, window_for};
+        let wanted = std::env::var("NECTARLINK_TEST_TAB").expect("NECTARLINK_TEST_TAB");
+        // SAFETY: COM for this test's thread.
+        let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+        use_physical_pixels();
+        let window = window_for("Chrome", &wanted).expect("the test tab's window");
+        let video = Automation::new().unwrap().video_rect(&window).expect("the video");
+        let frame = frame_of(window.hwnd).unwrap();
+        let crop = RECT {
+            left: video.left - frame.left,
+            top: video.top - frame.top,
+            right: video.right - frame.left,
+            bottom: video.bottom - frame.top,
+        };
+        let (w, h) = ((crop.right - crop.left) as u32, (crop.bottom - crop.top) as u32);
+        let mut capture = WindowCapture::new(window.hwnd).unwrap();
+        let mut bgra = Vec::new();
+        let started = std::time::Instant::now();
+        while !capture.capture(crop, w, h, &mut bgra) {
+            assert!(started.elapsed() < std::time::Duration::from_secs(3), "no frame");
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+        let distinct: std::collections::HashSet<&[u8; 4]> = bgra.as_chunks::<4>().0.iter().collect();
+        eprintln!("{crop:?} {w}x{h}: {} colors", distinct.len());
+        if let Ok(path) = std::env::var("NECTARLINK_TEST_DUMP") {
+            std::fs::write(path, &bgra).unwrap();
+        }
+        assert!(distinct.len() > 50);
+    }
+}

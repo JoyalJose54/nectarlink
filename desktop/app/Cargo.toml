@@ -1,0 +1,136 @@
+[package]
+name = "nectarlink-desktop"
+description = "NectarLink for Windows: the desktop app"
+version.workspace = true
+edition.workspace = true
+# Above the workspace minimum: material-colors needs Rust 1.97.
+rust-version = "1.97"
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+publish = false
+
+[[bin]]
+name = "nectarlink-desktop"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+blake3.workspace = true
+cxx.workspace = true
+cxx-qt.workspace = true
+cxx-qt-lib.workspace = true
+data-encoding.workspace = true
+dirs.workspace = true
+hostname.workspace = true
+material-colors.workspace = true
+nectarlink-core.workspace = true
+nectarlink-vcam.workspace = true
+qrcode.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# For the COM callbacks that `windows::core::implement` generates.
+windows-core.workspace = true
+windows = { workspace = true, features = [
+    "Data_Xml_Dom",
+    "Foundation",
+    "Foundation_Collections",
+    "Media",
+    "Media_Control",
+    "Security_Authorization_AppCapabilityAccess",
+    "Security_Cryptography",
+    "Storage",
+    "Storage_Provider",
+    "Storage_Search",
+    "Storage_Streams",
+    "ApplicationModel",
+    "ApplicationModel_Activation",
+    "ApplicationModel_Calls",
+    "ApplicationModel_DataTransfer",
+    "ApplicationModel_DataTransfer_ShareTarget",
+    "Devices_Bluetooth",
+    "Devices_Bluetooth_Advertisement",
+    "Devices_Bluetooth_Rfcomm",
+    "Devices_Enumeration",
+    "Gaming_Input",
+    "Graphics",
+    "Graphics_Capture",
+    "Graphics_DirectX",
+    "Graphics_DirectX_Direct3D11",
+    "UI_Notifications",
+    "Win32_Foundation",
+    "Win32_UI_Input_XboxController",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Imaging",
+    "Win32_Storage_CloudFilters",
+    "Win32_Storage_EnhancedStorage",
+    "Win32_Storage_FileSystem",
+    "Win32_System_CorrelationVector",
+    "Win32_System_IO",
+    "Win32_System_LibraryLoader",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Power",
+    "Win32_System_Registry",
+    "Win32_System_Shutdown",
+    "Win32_System_SystemInformation",
+    "Win32_NetworkManagement_WiFi",
+    "Win32_System_Threading",
+    "Win32_System_Time",
+    "Win32_System_WinRT",
+    "Win32_System_WinRT_Direct3D11",
+    "Win32_System_WinRT_Graphics_Capture",
+    "Win32_UI_Accessibility",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_WindowsFirewall",
+    "Win32_Networking_NetworkListManager",
+    "Win32_Networking_WinHttp",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
+    "Win32_Networking_WinSock",
+    "Win32_Media_Audio",
+    "Win32_Media_Audio_Endpoints",
+    "Win32_Media_KernelStreaming",
+    "Win32_Media_MediaFoundation",
+] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus.workspace = true
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+
+[build-dependencies]
+cc = "1"
+pkg-config = "0.3"
+cxx-qt-build = { workspace = true, features = ["link_qt_object_files"] }
+embed-resource.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
